@@ -19,7 +19,7 @@ class Preprocess(object):
     def __extract_luminance(self, frames):
         
         # RGB channel has 3 weights for each channel
-        luminance_wts = np.zeros(1, 1, 3)
+        luminance_wts = np.zeros((1, 1, 3))
         
         # Refer: https://en.wikipedia.org/wiki/YUV#Conversion_to.2Ffrom_RGB
         luminance_wts[0, 0, 0] = 0.299
@@ -33,9 +33,8 @@ class Preprocess(object):
     
     def __scale_images(self, frames):
         
-        result = map(lambda x: resize(x, self.rescale_size))
+        result = map(lambda x: resize(x, self.rescale_size, mode='symmetric'), frames)
         return result
-        
     
     def process_images(self, frames):
         
