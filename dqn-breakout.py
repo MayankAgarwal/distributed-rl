@@ -7,7 +7,6 @@ import torch
 import torch.optim as optim
 from torch.autograd import Variable
 import torch.nn.functional as F
-from ale_python_interface import ALEInterface
 
 
 # In[2]:
@@ -18,13 +17,15 @@ import matplotlib
 import matplotlib.pyplot as plt
 from collections import namedtuple
 import imageio
+import gc
+import os
 # get_ipython().magic(u'matplotlib inline')
 
 
 # In[3]:
 
 from modules.dqn import DQN
-from modules.preprocess import Preprocess
+from modules.env import Env
 from modules.replay_memory import ReplayMemory
 
 # get_ipython().magic(u'load_ext autoreload')
@@ -33,11 +34,7 @@ from modules.replay_memory import ReplayMemory
 
 # In[4]:
 
-GAME_ROM = 'roms/breakout.bin'
-
-ale = ALEInterface()
-ale.setBool('display_screen', False)
-ale.loadROM(GAME_ROM)
+print "PyTorch version: ", torch.__version__
 
 
 # In[5]:
@@ -55,33 +52,40 @@ torch.backends.cudnn.benchmark = use_cuda
 
 # In[6]:
 
+GAME_ROM = 'roms/breakout.bin'
+
 BATCH_SIZE = 32
-REPLAY_MEMORY_SIZE = 10**6
+REPLAY_MEMORY_SIZE = 100000  # Memory overflow with 10**6 sized replay memory
 AGENT_HISTORY_LENGTH = 4
-TARGET_NW_UPDATE_FREQ = 10**4
+TARGET_NW_UPDATE_FREQ = 10**3  # 10**4
 GAMMA = 0.99
 ACTION_REPEAT = 4
 IMG_RESCALE_SIZE = (84, 84)
+PREFILL_REPLAY_MEM_STEPS = 50000
+NOOP_RANGE = (0, 30)
 
 EPS_START = 1
 EPS_END = 0.1
 FINAL_EPS_FRAME = 10**6
 
-LR = 0.00025
-GRADIENT_MOMENTUM = 0.95    # UNUSED
-SQ_GRADIENT_MOMENTUM = 0.95 # UNUSED
+LR = 0.00005
+REG = 0
 
-ACTIONS = ale.getLegalActionSet()
-ACTION_CNT = len(ACTIONS)
+TRAINING_STEPS = 500000
+MODEL_SAVE_STEPS = 1000
+MOVIE_SAVE_STEPS = 1000
 
-TRAIN_EPISODES = 100001
-SAVE_EVERY = 10
-SAVE_MOVIE_EVERY = 50
+RESULTS_FOLDER = 'results/dqn-breakout/'
 
 
 # In[7]:
 
-preprocessor = Preprocess(IMG_RESCALE_SIZE)
+ENV = Env(
+    os.path.abspath(GAME_ROM), IMG_RESCALE_SIZE, NOOP_RANGE, FloatTensor, AGENT_HISTORY_LENGTH, ACTION_REPEAT)
+
+ACTIONS = ENV.action_set
+ACTION_CNT = len(ACTIONS)
+
 Transition = namedtuple('Transitions', ('state', 'action', 'reward', 'next_state'))
 
 dqn = DQN(AGENT_HISTORY_LENGTH, ACTION_CNT)
@@ -91,7 +95,7 @@ if use_cuda:
     dqn.cuda()
     target_dqn.cuda()
 
-optimizer = optim.RMSprop(dqn.parameters(), lr=LR)
+optimizer = optim.RMSprop(dqn.parameters(), lr=LR, weight_decay=REG)
 memory = ReplayMemory(REPLAY_MEMORY_SIZE, Transition)
 
 
@@ -101,12 +105,13 @@ memory = ReplayMemory(REPLAY_MEMORY_SIZE, Transition)
 
 g_steps_done = 0
 g_last_sync = 0
+g_total_frames = 0
 
 
 # In[9]:
 
 def get_epsilon():
-    global g_steps_done
+    global g_steps_done, g_total_frames
     
     if g_steps_done > FINAL_EPS_FRAME:
         return EPS_END
@@ -118,27 +123,23 @@ def select_action(state):
     
     global g_steps_done
     
+    result = None
     rand = random.random()
     eps = get_epsilon()
     g_steps_done += 1
     
     if rand > eps:
+        dqn.eval()  # Switch model to evaluation mode
         pred = dqn(Variable(state, volatile=True).type(FloatTensor)).data.max(1)
-        pred = pred[1].view(1, 1) # Single state action
+        dqn.train()  # Switch model back to train mode
         
+        pred = pred[1].view(1, 1) # Single state action
         idx = int(pred[0].cpu().numpy())
-        act = LongTensor([[int(ACTIONS[idx])]])
-        return act
+        result = idx
     else:
-        return LongTensor([[int(random.choice(ACTIONS))]])
-
-def get_state_tensor(state):
-    
-    state_tensor = torch.from_numpy(state).type(FloatTensor)
-    if len(state_tensor.size()) == 3:  # 3d tensor
-        state_tensor = state_tensor.unsqueeze(0)
-    
-    return state_tensor
+        result = random.randrange(0, ACTION_CNT)
+        
+    return LongTensor([[result]])
 
 
 # In[10]:
@@ -177,10 +178,14 @@ def optimize_model():
     
     next_state_values.volatile = False
     
-    expected_state_action_values = reward_batch + GAMMA * next_state_values
+    expected_state_action_values = reward_batch.squeeze() + GAMMA * next_state_values
     
     loss = F.smooth_l1_loss(state_action_values, expected_state_action_values)
     loss.backward()
+    
+    for p in dqn.parameters():
+        p.grad.data.clamp_(-1, 1)
+    
     optimizer.step()
     
     g_last_sync += 1
@@ -188,18 +193,118 @@ def optimize_model():
 
 # In[11]:
 
+def prefill_replay_mem():
+    
+    global memory
+    
+    done = False
+    state = ENV.get_state()
+
+    for i in xrange(PREFILL_REPLAY_MEM_STEPS):
+        
+        if done:
+            ENV.reset_game()
+            state = ENV.get_state()
+            done = False
+
+        action_idx = random.randrange(0, ACTION_CNT)
+        action_val = ACTIONS[action_idx]
+        action = LongTensor([[action_idx]])
+
+        next_state, reward, done = ENV.take_action(action_val)
+        reward = Tensor([[reward]])
+        memory.push(state, action, reward, next_state)
+        state = next_state
+
+
+# In[12]:
+
+game_rewards = []
+total_rewards = 0.0
+done = False
+movie_frames = []
+
+last_model_save, last_movie_save = 0, 0
+save_movie = False
+
+# TODO : Pre-fill experience replay memory
+print "Filling experience replay memory with random actions"
+prefill_replay_mem()
+print "Replay memory initialized. Length = %d " % len(memory)
+
+ENV.reset_game()
+state = ENV.get_state()
+
+print "Training starts"
+
+for step_i in xrange(TRAINING_STEPS):
+    
+    if done:
+        done = ENV.reset_game()
+        state = ENV.get_state()
+        
+        print "Life complete. Reward = %f" % total_rewards
+        game_rewards.append(total_rewards)
+        
+        if save_movie:
+            imageio.mimsave(RESULTS_FOLDER + 'train-step_%d__eps_%f.gif' % (step_i, get_epsilon()), movie_frames)
+            save_movie = False
+        
+        total_rewards = 0.0
+        movie_frames = []
+        
+        gc.collect()
+    
+    action = select_action(state)
+    action_val = ACTIONS[int(action.cpu().numpy()[0, 0])]
+    
+    next_state, reward, done = ENV.take_action(action_val)
+    
+    total_rewards += reward
+    movie_frames.append(np.copy(ENV.get_current_screen()))
+    reward = Tensor([[reward]])
+    
+    memory.push(state, action, reward, next_state)
+    
+    state = next_state
+    optimize_model()
+    
+    if (step_i - last_model_save) >= MODEL_SAVE_STEPS:
+        torch.save(dqn.state_dict(), RESULTS_FOLDER + 'dqn-%d.pth' % step_i)
+        torch.save(target_dqn.state_dict(), RESULTS_FOLDER + 'target-dqn-%d.pth' % step_i)
+        np.save(RESULTS_FOLDER + 'game_rewards', game_rewards)
+        last_model_save = step_i
+    
+    if (step_i - last_movie_save) >= MOVIE_SAVE_STEPS:
+        save_movie = True
+        last_movie_save = step_i
+        
+    if step_i % 1000 == 0:
+        print "%d steps trained. Epsilon: %f" % (step_i, get_epsilon())
+
+
+# In[ ]:
+
+
+
+
+# In[ ]:
+
+"""
 episode_rewards = []
-total_frames = 0
+w, h = ale.getScreenDims()
 
 for episode in xrange(TRAIN_EPISODES):
     total_reward = 0.0
     done = False
-    action_count = 0
-    temp_lives_rem = -1
+    action_count = -1
     movie_frames = []
     
-    ale.reset_game()
-    w, h = ale.getScreenDims()
+    if ale.lives() <= 0:
+        ale.reset_game()
+    
+    temp_lives_rem = ale.lives()
+    
     curr_frame = np.zeros((h, w, 3), dtype=np.uint8)
     ale.getScreenRGB(screen_data=curr_frame)
     
@@ -209,26 +314,16 @@ for episode in xrange(TRAIN_EPISODES):
     
     # Use lives remaining to define an episode
     while not done:
+        action_count = (action_count + 1)%ACTION_REPEAT
+        
         # Skip-framing
         if action_count == 0:
             action = select_action(state)
-            action_int = int(action.cpu().numpy()[0, 0])
+            action_val = ACTIONS[int(action.cpu().numpy()[0, 0])]
         
-        action_count = (action_count + 1)%ACTION_REPEAT
-        
-        reward = ale.act(action_int)
+        reward = ale.act(action_val)
         reward = max(min(1, reward), -1)  # Clamp rewards in range [-1, 1]
-        done = (ale.lives()<=0)
-        
-        if episode % SAVE_MOVIE_EVERY == 0: movie_frames.append(np.copy(curr_frame))
-        
-        total_reward += reward
-        reward = Tensor([reward])
-        total_frames += 1e-6
-        
-        if ale.lives() != temp_lives_rem:
-            print "\t Lives remaining: ", ale.lives()
-            temp_lives_rem = ale.lives()
+        done = (ale.lives() != temp_lives_rem)  # Consider life lost as a terminal state
         
         if not done:
             ale.getScreenRGB(screen_data=curr_frame)
@@ -238,28 +333,27 @@ for episode in xrange(TRAIN_EPISODES):
         else:
             next_state = None
             
+        total_reward += reward
+        reward = Tensor([reward])
+        g_total_frames += 1
+            
         memory.push(state, action, reward, next_state)
         state = next_state
         optimize_model()
         
+        if episode % SAVE_MOVIE_EVERY == 0: movie_frames.append(np.copy(curr_frame))
+        
     if episode % SAVE_EVERY == 0:
-        torch.save(dqn.state_dict(), 'results/dqn-%d.pth' % episode)
-        torch.save(target_dqn.state_dict(), 'results/target-dqn-%d.pth' % episode)
-        np.save('results/episode_rewards', episode_rewards)
+        torch.save(dqn.state_dict(), RESULTS_FOLDER + 'dqn-%d.pth' % episode)
+        torch.save(target_dqn.state_dict(), RESULTS_FOLDER + 'target-dqn-%d.pth' % episode)
+        np.save(RESULTS_FOLDER + 'episode_rewards', episode_rewards)
     
     if episode % SAVE_MOVIE_EVERY == 0:
-        imageio.mimsave('results/train-episode_%d__eps_%f.gif' % (episode, get_epsilon()), movie_frames)
+        imageio.mimsave(RESULTS_FOLDER + 'train-episode_%d__eps_%f.gif' % (episode, get_epsilon()), movie_frames)
     
-    print "Episode %d, Total Reward: %f, Total frames: %f, eps: %f" % (episode, total_reward, total_frames, get_epsilon())
+    print "Episode %d, Total Reward: %f, Total frames: %f, eps: %f" % (episode, total_reward, g_total_frames, get_epsilon())
     episode_rewards.append(total_reward)
-
-
-# In[ ]:
-
-
-
-
-# In[ ]:
-
-
+    
+    gc.collect()
+"""
 

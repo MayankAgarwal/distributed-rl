@@ -5,10 +5,10 @@
 #SBATCH -e dqn_%j.err   # File to which STDERR will be written
 ##SBATCH --partition=m40-short # Partition to submit to
 #SBATCH -n 1
-#SBATCH --gres=gpu:2
+#SBATCH --gres=gpu:3
 #SBATCH -N 1
 #SBATCH --time=1-0:00:00       # Runtime in D-HH:MM
-#SBATCH --mem=20000
+#SBATCH --mem=40000
 ##SBATCH --exclude=node[050-099]
 
 
