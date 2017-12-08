@@ -1,8 +1,8 @@
 #!/bin/bash
 #
-#SBATCH --job-name=ddqn
-#SBATCH -o double_dqn_%j.txt  # output file
-#SBATCH -e double_dqn_%j.err   # File to which STDERR will be written
+#SBATCH --job-name=dueldqn
+#SBATCH -o dueling_dqn_%j.txt  # output file
+#SBATCH -e dueling_dqn_%j.err   # File to which STDERR will be written
 ##SBATCH --partition=m40-short # Partition to submit to
 #SBATCH -n 1
 #SBATCH --gres=gpu:3
@@ -12,6 +12,6 @@
 ##SBATCH --exclude=node[050-099]
 
 
-python double-dqn-breakout.py
+python dueling-dqn-breakout.py
 echo done learning!
 exit
