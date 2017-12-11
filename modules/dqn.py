@@ -1,10 +1,11 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from layers import NoisyLinear
 
 class DQN(nn.Module):
     
-    def __init__(self, input_channels, action_cnt):
+    def __init__(self, input_channels, action_cnt, is_noisy=False):
         
         super(DQN, self).__init__()
         
@@ -20,7 +21,10 @@ class DQN(nn.Module):
         self.fc4 = nn.Linear(3136, 512, bias=True)
         self.bn4 = nn.BatchNorm1d(512)
         
-        self.out = nn.Linear(512, action_cnt, bias=True)
+        if is_noisy:
+            self.out = NoisyLinear(512, action_cnt)
+        else:
+            self.out = nn.Linear(512, action_cnt, bias=True)
         
     def forward(self, x):
         
