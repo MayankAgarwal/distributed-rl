@@ -18,12 +18,13 @@ class DQN(nn.Module):
         self.conv3 = nn.Conv2d(64, 64, kernel_size=3, stride=1)
         self.bn3 = nn.BatchNorm2d(64)
         
-        self.fc4 = nn.Linear(3136, 512, bias=True)
-        self.bn4 = nn.BatchNorm1d(512)
-        
         if is_noisy:
+            self.fc4 = NoisyLinear(3136, 512)
+            self.bn4 = nn.BatchNorm1d(512)
             self.out = NoisyLinear(512, action_cnt)
         else:
+            self.fc4 = nn.Linear(3136, 512, bias=True)
+            self.bn4 = nn.BatchNorm1d(512)
             self.out = nn.Linear(512, action_cnt, bias=True)
         
     def forward(self, x):

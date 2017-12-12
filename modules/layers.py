@@ -12,34 +12,29 @@ class NoisyLinear(nn.Module):
         self.in_features = in_features
         self.out_features = out_features
         self.var0 = var0
-        
         self.eps_w, self.eps_b = None, None
+
+        self.is_cuda = torch.cuda.is_available()
+        self.floatTensor = torch.cuda.FloatTensor if self.is_cuda else torch.FloatTensor
         
         self.mu_w = nn.Parameter(torch.Tensor(out_features, in_features))
         self.var_w = nn.Parameter(torch.Tensor(out_features, in_features))
         self.mu_b = nn.Parameter(torch.Tensor(out_features))
         self.var_b = nn.Parameter(torch.Tensor(out_features))
-        
-        self.__init_eps()
         self.reset_parameters()
     
     def __init_eps(self):
         
-        eps_i = torch.normal(
-            means=torch.zeros(1, self.in_features), 
-            std=torch.ones(1, self.in_features)
-        )
-        
-        eps_j = torch.normal(
-            means=torch.zeros(self.out_features, 1),
-            std=torch.ones(self.out_features, 1)
-        )
+        eps_i = torch.Tensor(self.in_features).normal_()
+        eps_j = torch.Tensor(self.out_features).normal_()
         
         f_eps_i = torch.sign(eps_i) * torch.sqrt(torch.abs(eps_i))
         f_eps_j = torch.sign(eps_j) * torch.sqrt(torch.abs(eps_j))
         
-        self.eps_w = Variable(torch.mm(f_eps_j, f_eps_i), requires_grad=False)
-        self.eps_b = Variable(f_eps_j.squeeze(), requires_grad=False)
+        eps_w = torch.ger(f_eps_j, f_eps_i)
+        eps_b = f_eps_j
+
+        return eps_w, eps_b
         
     def reset_parameters(self):
         
@@ -53,7 +48,8 @@ class NoisyLinear(nn.Module):
         
     def forward(self, input_):
         
-        W = self.mu_w + self.var_w*self.eps_w
-        b = self.mu_b + self.var_b*self.eps_b
+        eps_w, eps_b = self.__init_eps()
+        W = self.mu_w + self.var_w.mul(Variable(eps_w).type(self.floatTensor))
+        b = self.mu_b + self.var_b.mul(Variable(eps_b).type(self.floatTensor))
         return F.linear(input_, W, b)
         
