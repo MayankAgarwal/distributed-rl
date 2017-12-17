@@ -12,6 +12,6 @@
 ##SBATCH --exclude=node[050-099]
 
 
-python noisydqn-breakout.py
+python ../noisydqn-breakout.py
 echo done learning!
 exit

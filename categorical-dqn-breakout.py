@@ -24,7 +24,7 @@ import os
 
 # In[3]:
 
-from modules.dqn import DQN
+from modules.categoricaldqn import CategoricalDQN
 from modules.env import Env
 from modules.replay_memory import ReplayMemory
 
@@ -61,24 +61,33 @@ TARGET_NW_UPDATE_FREQ = 10**4
 GAMMA = 0.99
 ACTION_REPEAT = 4
 IMG_RESCALE_SIZE = (84, 84)
-PREFILL_REPLAY_MEM_STEPS = 50000
+PREFILL_REPLAY_MEM_STEPS = 1000 #50000
 NOOP_RANGE = (0, 30)
 
-EPS_START = 0
-EPS_END = 0
-FINAL_EPS_FRAME = 0
+EPS_START = 0.5
+EPS_END = 0.1
+FINAL_EPS_FRAME = 1e6
 
-LR = 0.00005
+LR = 0.00025
 REG = 0
 
 TRAINING_STEPS = 5000000
 MODEL_SAVE_STEPS = 25000
 MOVIE_SAVE_STEPS = 25000
 
-RESULTS_FOLDER = 'results/noisy_dqn-breakout1/'
+RESULTS_FOLDER = 'results/categorical_dqn-breakout/'
 
 
 # In[7]:
+
+V_min, V_max = -10., 10.
+N_atoms = 51
+
+delta_z = (V_max - V_min)/(N_atoms - 1)
+support = torch.linspace(V_min, V_max, N_atoms).type(FloatTensor)
+
+
+# In[8]:
 
 ENV = Env(
     os.path.abspath(GAME_ROM), IMG_RESCALE_SIZE, NOOP_RANGE, FloatTensor, AGENT_HISTORY_LENGTH, ACTION_REPEAT)
@@ -88,18 +97,18 @@ ACTION_CNT = len(ACTIONS)
 
 Transition = namedtuple('Transitions', ('state', 'action', 'reward', 'next_state'))
 
-dqn = DQN(AGENT_HISTORY_LENGTH, ACTION_CNT, is_noisy=True)
-target_dqn = DQN(AGENT_HISTORY_LENGTH, ACTION_CNT, is_noisy=True)
+dqn = CategoricalDQN(AGENT_HISTORY_LENGTH, N_atoms, ACTION_CNT, is_noisy=False)
+target_dqn = CategoricalDQN(AGENT_HISTORY_LENGTH, N_atoms, ACTION_CNT, is_noisy=False)
 
 if use_cuda:
     dqn.cuda()
     target_dqn.cuda()
 
-optimizer = optim.RMSprop(dqn.parameters(), lr=LR, weight_decay=REG)
+optimizer = optim.Adam(dqn.parameters(), lr=LR, weight_decay=REG)
 memory = ReplayMemory(REPLAY_MEMORY_SIZE, Transition)
 
 
-# In[8]:
+# In[9]:
 
 # Global variable definition
 
@@ -108,10 +117,24 @@ g_last_sync = 0
 g_total_frames = 0
 
 
-# In[9]:
+# In[10]:
+
+def get_Q_values(out_probs):
+    global support
+    # out_probs - (N, A, Z)
+    support_cp = support.unsqueeze(1)  # Make support (Z, 1)
+    q_values = torch.bmm(out_probs, support_cp.unsqueeze(0).expand(out_probs.size(0), *support_cp.size()).type(FloatTensor))
+    q_values = q_values.squeeze()
+    return q_values
 
 def get_epsilon():
-    return 0.0
+    global g_steps_done, g_total_frames
+    
+    if g_steps_done > FINAL_EPS_FRAME:
+        return EPS_END
+
+    eps = EPS_START + (EPS_END - EPS_START)*g_steps_done / FINAL_EPS_FRAME
+    return eps
 
 def select_action(state):
     
@@ -124,7 +147,9 @@ def select_action(state):
     
     if rand >= eps:
         dqn.eval()  # Switch model to evaluation mode
-        pred = dqn(Variable(state, volatile=True).type(FloatTensor)).data.max(1)
+        probs = dqn(Variable(state, volatile=True)).data  # (Actions x N_atoms)
+        q_vals = get_Q_values(probs)
+        pred = q_vals.max(0)   # Single state action selection
         dqn.train()  # Switch model back to train mode
         
         pred = pred[1].view(1, 1) # Single state action
@@ -136,16 +161,17 @@ def select_action(state):
     return LongTensor([[result]])
 
 
-# In[10]:
+# In[11]:
 
 def optimize_model():
-    global g_last_sync
+    global g_last_sync, support, V_min, V_max, delta_z, N_atoms
     
     dqn.zero_grad()
     
     if len(memory) < BATCH_SIZE:
         return
     
+    # Sync target network with the prediction network
     if g_last_sync % TARGET_NW_UPDATE_FREQ == 0:
         # https://discuss.pytorch.org/t/are-there-any-recommended-methods-to-clone-a-model/483/3
         target_dqn.load_state_dict(dqn.state_dict())
@@ -157,35 +183,57 @@ def optimize_model():
     transitions = memory.sample(BATCH_SIZE)
     batch = Transition(*zip(*transitions))
     
-    non_final_mask = ByteTensor(tuple(map(lambda s: s is not None, batch.next_state)))
-    non_final_next_states = Variable(torch.cat([s for s in batch.next_state
+    non_final_mask = ByteTensor(tuple(map(lambda s: s is not None, batch.next_state)))  # 32 sized tensor (0-1 tensor)
+    next_state_batch = Variable(torch.cat([s for s in batch.next_state
                                                if s is not None]), volatile=True)
     
-    state_batch = Variable(torch.cat(batch.state))
-    action_batch = Variable(torch.cat(batch.action))
-    reward_batch = Variable(torch.cat(batch.reward))
+    state_batch = Variable(torch.cat(batch.state))  # 32 x 4 x 84 x 84
+    action_batch = Variable(torch.cat(batch.action)) # 32 x 1
+    reward_batch = torch.cat(batch.reward) # 32 x 1
     
-    state_action_values = dqn(state_batch).gather(1, action_batch)
+    p_s = dqn(state_batch)    # 32 x 4 x 51
+    p_sa = p_s.gather(1, action_batch.unsqueeze(2).expand(BATCH_SIZE, 1, N_atoms))   # 32 x 1 x 51
+    p_sa = p_sa.squeeze()   # 32 x 51
     
-    next_state_values = Variable(torch.zeros(BATCH_SIZE).type(Tensor))
-    next_state_values[non_final_mask] = target_dqn(non_final_next_states).max(1)[0]
+    # Double Q-learning
+    s_t1_cnt = next_state_batch.size(0)
+    p_s1 = dqn(next_state_batch).data  # 32 x 4 x 51
+    q_s1 = get_Q_values(p_s1)   # 32 x 4
+    a_opt_s1 = q_s1.max(1)[1].unsqueeze(1)   # 32 x 1 Long Tensor
     
-    next_state_values.volatile = False
+    next_state_probs = target_dqn(next_state_batch).data   # X x 4 x 51
+    next_state_action_probs = next_state_probs.gather(1, a_opt_s1.unsqueeze(2).expand(a_opt_s1.size(0), 1, N_atoms))  # X x 1 x 51
+    next_state_action_probs = next_state_action_probs.squeeze()   # X x 51
     
-    expected_state_action_values = reward_batch.squeeze() + GAMMA * next_state_values
+    p_s1_a = torch.Tensor(BATCH_SIZE, N_atoms).zero_().type(FloatTensor)
+    p_s1_a[non_final_mask.unsqueeze(1).expand(BATCH_SIZE, N_atoms)] = next_state_action_probs.type(FloatTensor)
     
-    loss = F.smooth_l1_loss(state_action_values, expected_state_action_values)
+    Tz = reward_batch + GAMMA * non_final_mask.unsqueeze(1).type(FloatTensor) * support.unsqueeze(0)  # (32, 51)
+    
+    Tz.clamp_(min=V_min, max=V_max)  # (32, 51)
+    
+    b = (Tz - V_min)/delta_z  # (32, 51)
+    l, u = b.floor().long(), b.ceil().long()  # (32, 51)
+    
+    m = torch.Tensor(BATCH_SIZE, N_atoms).type(FloatTensor).zero_()
+    offset = torch.linspace(0, ((BATCH_SIZE - 1) * N_atoms), BATCH_SIZE).long().unsqueeze(1).expand(BATCH_SIZE, N_atoms).type(LongTensor)
+    m.view(-1).index_add_(0, (l + offset).view(-1), (p_s1_a * (u.float() - b)).view(-1))
+    m.view(-1).index_add_(0, (u + offset).view(-1), (p_s1_a * (b - l.float())).view(-1))   # 32 x 51
+    
+    loss = -torch.sum(Variable(m, requires_grad=False) * p_sa.log())
+    
+    dqn.zero_grad()
     loss.backward()
     
-    for p in dqn.parameters():
-        p.grad.data.clamp_(-1, 1)
+    # for p in dqn.parameters():
+    #     p.grad.data.clamp_(-1, 1)
     
     optimizer.step()
     
     g_last_sync += 1
 
 
-# In[11]:
+# In[ ]:
 
 def prefill_replay_mem():
     
@@ -211,7 +259,7 @@ def prefill_replay_mem():
         state = next_state
 
 
-# In[12]:
+# In[ ]:
 
 game_rewards = []
 total_rewards = 0.0
@@ -272,7 +320,7 @@ for step_i in xrange(TRAINING_STEPS):
     optimize_model()
     
     if (step_i - last_model_save) >= MODEL_SAVE_STEPS:
-        torch.save(dqn.state_dict(), RESULTS_FOLDER + 'noisy_dqn-%d.pth' % step_i)
+        torch.save(dqn.state_dict(), RESULTS_FOLDER + 'categorical_dqn-%d.pth' % step_i)
         np.save(RESULTS_FOLDER + 'game_rewards', game_rewards)
         last_model_save = step_i
     
@@ -282,4 +330,14 @@ for step_i in xrange(TRAINING_STEPS):
         
     if step_i % 1000 == 0:
         print "%d steps trained. Epsilon: %f" % (step_i, get_epsilon())
+
+
+# In[ ]:
+
+
+
+
+# In[ ]:
+
+
 

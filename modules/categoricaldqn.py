@@ -3,11 +3,14 @@ import torch.nn as nn
 import torch.nn.functional as F
 from layers import NoisyLinear, NoisyFactorizedLinear
 
-class DQN(nn.Module):
+class CategoricalDQN(nn.Module):
     
-    def __init__(self, input_channels, action_cnt, is_noisy=False):
+    def __init__(self, input_channels, N_atoms, action_cnt, is_noisy=False):
         
-        super(DQN, self).__init__()
+        super(CategoricalDQN, self).__init__()
+
+        self._N_atoms = N_atoms
+        self._action_cnt = action_cnt
         
         self.conv1 = nn.Conv2d(input_channels, 32, kernel_size=8, stride=4)
         self.bn1 = nn.BatchNorm2d(32)
@@ -21,19 +24,24 @@ class DQN(nn.Module):
         if is_noisy:
             self.fc4 = NoisyLinear(3136, 512)
             self.bn4 = nn.BatchNorm1d(512)
-            self.out = NoisyLinear(512, action_cnt)
+            self.out = NoisyLinear(512, action_cnt*N_atoms)
         else:
             self.fc4 = nn.Linear(3136, 512, bias=True)
             self.bn4 = nn.BatchNorm1d(512)
-            self.out = nn.Linear(512, action_cnt, bias=True)
+            self.out = nn.Linear(512, action_cnt*N_atoms, bias=True)
         
     def forward(self, x):
+
+        n = x.size(0)
         
         x = F.relu(self.bn1(self.conv1(x)))
         x = F.relu(self.bn2(self.conv2(x)))
         x = F.relu(self.bn3(self.conv3(x)))
         
-        x = x.view(x.size(0), -1)
+        x = x.view(n, -1)
         x = F.relu(self.bn4(self.fc4(x)))
-        
-        return self.out(x)
+
+        probs = self.out(x)
+        probs = probs.view(n, self._action_cnt, self._N_atoms)
+        probs = F.softmax(probs, dim=-1)
+        return probs.clamp(min=1e-8, max=1-1e-8)  # Clipping to prevent NaN

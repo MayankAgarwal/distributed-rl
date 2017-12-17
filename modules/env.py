@@ -58,14 +58,15 @@ class Env(object):
     def __isdone(self):
         return self._ale.lives() <= 0
     
-    def take_action(self, action):
+    def take_action(self, action, clip_rewards=True):
 
         i = 0
         total_reward = 0.0
 
         while not self.__isdone() and i <= self._action_repeat:
             reward = self._ale.act(action)
-            reward = min(1, max(reward, -1))
+            if clip_rewards: 
+                reward = min(1, max(reward, -1))
             total_reward += reward
             i += 1
         
